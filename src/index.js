@@ -137,7 +137,7 @@ function createMcpServer() {
   const server = new McpServer({ name: "garmin-mcp", version: "1.0.0" });
 
   server.tool("complete_garmin_mfa",
-    "Complete a pending Garmin Connect login using the one-time MFA code sent by Garmin. Call another Garmin tool first to start login and request the code.",
+    "Complete a pending Garmin Connect login using the six-digit one-time code sent by Garmin, normally by email. This does not require a Garmin Authentication App. Call another Garmin tool first to start login and request the code.",
     {
       code: z.string().regex(/^\d{6}$/, "Must be a 6-digit Garmin MFA code"),
     },
@@ -148,7 +148,7 @@ function createMcpServer() {
   );
 
   server.tool("get_garmin_mfa_status",
-    "Check whether Garmin MFA is pending and show the masked destination and delivery method.",
+    "Check whether Garmin MFA is pending and show the evidence-based delivery method and masked destination. Garmin normally sends the six-digit code by email; do not claim a Garmin Authentication App is required.",
     {},
     async () => {
       const result = await getGarminMfaStatus();
@@ -157,7 +157,7 @@ function createMcpServer() {
   );
 
   server.tool("resend_garmin_mfa",
-    "Explicitly ask Garmin to send a fresh MFA code for the pending login challenge.",
+    "Explicitly ask Garmin to send a fresh six-digit MFA code for the pending login challenge, normally by email. This does not require a Garmin Authentication App.",
     {},
     async () => {
       const result = await resendGarminMfa();

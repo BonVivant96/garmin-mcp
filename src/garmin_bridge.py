@@ -24,13 +24,35 @@ def mfa_details():
         return match.group(1) if match else None
 
     title_match = re.search(r"<title>([^<]*)</title>", html, re.IGNORECASE)
+    destination = value("codeSentTo")
+    raw_method = value("mfaMethod") or getattr(garmin.client, "_mfa_method", None)
+    if destination and "@" in destination:
+        delivery_method = "email"
+        guidance = (
+            "Enter the six-digit code Garmin sent by email. This challenge does "
+            "not require a Garmin Authentication App."
+        )
+    elif destination:
+        delivery_method = "one-time code"
+        guidance = "Enter the six-digit code Garmin sent to the masked destination."
+    elif raw_method and str(raw_method).lower() in {"email", "sms"}:
+        delivery_method = str(raw_method).lower()
+        guidance = f"Enter the six-digit one-time code Garmin sent via {delivery_method}."
+    else:
+        delivery_method = "one-time code"
+        guidance = (
+            "Enter the latest six-digit code Garmin sent. Do not infer that a "
+            "Garmin Authentication App is required from Garmin's internal method value."
+        )
+
     return {
         "pending": True,
         "flow": getattr(garmin.client, "_mfa_flow", None),
-        "method": value("mfaMethod") or getattr(garmin.client, "_mfa_method", None),
-        "destination": value("codeSentTo"),
+        "deliveryMethod": delivery_method,
+        "destination": destination,
         "page": title_match.group(1) if title_match else None,
         "canResend": bool(value("customerGuid") and value("mfaMethod")),
+        "guidance": guidance,
     }
 
 
@@ -106,7 +128,7 @@ def ensure_login():
         if details["canResend"]:
             details = resend_mfa()
             message = (
-                f"Fresh Garmin MFA code requested via {details['method']} to "
+                f"Fresh Garmin MFA code requested via {details['deliveryMethod']} to "
                 f"{details['destination']}."
             )
         else:

@@ -157,7 +157,7 @@ function createMcpServer() {
   );
 
   server.tool("resend_garmin_mfa",
-    "Ask Garmin to send a fresh six-digit MFA code, normally by email. If Garmin exposes no resend endpoint, this starts a new login challenge to trigger a new email. Observe Garmin's cooldown before retrying.",
+    "Ask Garmin to send one fresh six-digit MFA email. Call only when no email arrived, and wait at least five minutes between attempts because repeated requests prevent Garmin delivery.",
     {},
     async () => {
       const result = await resendGarminMfa();
@@ -315,6 +315,8 @@ Example steps:
 // ─── Express app ──────────────────────────────────────────────────────────────
 
 const app = express();
+// Requests arrive through ngrok; trust its single forwarded-proxy hop.
+app.set("trust proxy", 1);
 app.use(express.json());
 
 // Mount all OAuth 2.0 endpoints:

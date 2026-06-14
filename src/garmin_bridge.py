@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -11,7 +12,8 @@ from garminconnect import Garmin
 garmin = None
 mfa_pending = False
 mfa_last_requested_at = 0.0
-MFA_RESEND_COOLDOWN_SECONDS = 30
+failed_mfa_code_hashes = set()
+MFA_RESEND_COOLDOWN_SECONDS = 300
 token_dir = str(Path(os.getenv("GARMIN_TOKEN_DIR", ".garmin-tokens")).resolve())
 
 
@@ -101,14 +103,15 @@ def explicit_resend_mfa():
 
 
 def start_login():
-    global garmin, mfa_pending, mfa_last_requested_at
+    global garmin, mfa_pending, mfa_last_requested_at, failed_mfa_code_hashes
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
     if not email or not password:
         raise RuntimeError("GARMIN_EMAIL and GARMIN_PASSWORD must be set in .env")
 
     garmin = Garmin(email=email, password=password, return_on_mfa=True)
-    # Widget MFA exposes Garmin's explicit resend-code endpoint when available.
+    failed_mfa_code_hashes = set()
+    # Widget MFA can expose Garmin's explicit resend-code endpoint.
     garmin.client.skip_strategies = [
         "mobile+cffi",
         "mobile+requests",
@@ -122,13 +125,22 @@ def start_login():
         return {"authenticated": True}
 
     mfa_pending = True
-    # Posting credentials creates the challenge and triggers Garmin's automatic
-    # email flow, including widget variants that expose no resend endpoint.
     mfa_last_requested_at = time.monotonic()
     details = mfa_details()
     if details["canResend"]:
         return explicit_resend_mfa()
-    return {**details, "requested": True, "requestMechanism": "new login challenge"}
+
+    # Garmin serves this variant when an email challenge already exists. It has
+    # no resend control, so do not claim that opening it sent another email.
+    return {
+        **details,
+        "requested": False,
+        "requestMechanism": None,
+        "reason": (
+            "Garmin did not expose its email resend endpoint. An existing email "
+            "challenge may still be active; wait before requesting another."
+        ),
+    }
 
 
 def resend_mfa():
@@ -141,14 +153,15 @@ def resend_mfa():
     if elapsed < MFA_RESEND_COOLDOWN_SECONDS:
         wait_seconds = max(1, int(MFA_RESEND_COOLDOWN_SECONDS - elapsed))
         raise RuntimeError(
-            f"Garmin MFA resend cooldown active. Retry in about {wait_seconds} seconds."
+            f"Garmin MFA resend cooldown active. Retry in about {wait_seconds} seconds. "
+            "Repeated requests can prevent Garmin from sending another email."
         )
 
     if details["flow"] == "widget" and details["canResend"]:
         return explicit_resend_mfa()
 
-    # Some Garmin email-MFA pages expose no resend endpoint. Starting a fresh
-    # widget login is the only way to ask Garmin to send another code.
+    # Some Garmin email-MFA pages expose no resend endpoint. Start one fresh
+    # widget challenge after cooldown; do not loop against Garmin.
     garmin = None
     mfa_pending = False
     return start_login()
@@ -167,16 +180,15 @@ def ensure_login():
     if garmin is not None and not mfa_pending:
         return None
     if mfa_pending:
-        elapsed = time.monotonic() - mfa_last_requested_at
-        if elapsed < MFA_RESEND_COOLDOWN_SECONDS:
-            wait_seconds = max(1, int(MFA_RESEND_COOLDOWN_SECONDS - elapsed))
-            return {
-                **mfa_details(),
-                "requested": False,
-                "retryAfterSeconds": wait_seconds,
-            }
-        details = resend_mfa()
-        return details
+        return {
+            **mfa_details(),
+            "requested": False,
+            "message": (
+                "Garmin MFA is pending. Call complete_garmin_mfa with the latest "
+                "six-digit email code, or call resend_garmin_mfa once if no new "
+                "email arrived."
+            ),
+        }
 
     details = start_login()
     if details.get("pending"):
@@ -191,7 +203,19 @@ def complete_mfa(code):
             "No Garmin MFA challenge is pending. Call any Garmin data tool first "
             "to start login."
         )
-    garmin.client._complete_mfa(code)
+    code_hash = hashlib.sha256(code.encode()).hexdigest()
+    if code_hash in failed_mfa_code_hashes:
+        raise RuntimeError(
+            "Garmin already rejected this MFA code. Do not retry it; use the newest "
+            "email code or wait before requesting one fresh code."
+        )
+    try:
+        garmin.client._complete_mfa(code)
+    except Exception as error:
+        failed_mfa_code_hashes.add(code_hash)
+        raise RuntimeError(
+            f"Garmin rejected this MFA code: {error}. Do not retry the same code."
+        ) from error
     garmin.client.dump(token_dir)
     mfa_pending = False
     return {"authenticated": True}

@@ -261,6 +261,18 @@ server.tool(
 const app = express();
 const transports = {}; // sessionId → SSEServerTransport
 
+app.get("/", (_, res) =>
+  res.json({
+    name: "garmin-mcp",
+    status: "ok",
+    endpoints: {
+      health: "/health",
+      sse: "/sse",
+      messages: "/messages",
+    },
+  })
+);
+
 // Health check — also useful to verify the ngrok tunnel is alive
 app.get("/health", (_, res) =>
   res.json({ status: "ok", server: "garmin-mcp", tools: 8 })

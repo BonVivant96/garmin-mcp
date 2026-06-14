@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
 import dotenv from "dotenv";
@@ -11,10 +11,11 @@ const PORT = process.env.PORT || 3000;
 
 // ─── MCP server ───────────────────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: "garmin-mcp",
-  version: "1.0.0",
-});
+function createServer() {
+  const server = new McpServer({
+    name: "garmin-mcp",
+    version: "1.0.0",
+  });
 
 // ─── Lookup tables ─────────────────────────────────────────────────────────────
 
@@ -256,10 +257,13 @@ server.tool(
   }
 );
 
-// ─── Express + SSE transport ──────────────────────────────────────────────────
+  return server;
+}
+
+// ─── Express + Streamable HTTP transport ────────────────────────────────────── 
 
 const app = express();
-const transports = {}; // sessionId → SSEServerTransport
+app.use(express.json());
 
 app.get("/", (_, res) =>
   res.json({
@@ -267,8 +271,7 @@ app.get("/", (_, res) =>
     status: "ok",
     endpoints: {
       health: "/health",
-      sse: "/sse",
-      messages: "/messages",
+      mcp: "/mcp",
     },
   })
 );
@@ -278,34 +281,53 @@ app.get("/health", (_, res) =>
   res.json({ status: "ok", server: "garmin-mcp", tools: 8 })
 );
 
-// Claude.ai opens this endpoint to start an MCP session
-app.get("/sse", async (req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-
-  res.on("close", () => {
-    delete transports[transport.sessionId];
-    console.log(`Session closed: ${transport.sessionId}`);
+app.post("/mcp", async (req, res) => {
+  const server = createServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
   });
 
-  console.log(`New session:    ${transport.sessionId}`);
-  await server.connect(transport);
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("MCP request failed:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
+  }
+
+  res.on("close", async () => {
+    await transport.close();
+    await server.close();
+  });
 });
 
-// Claude.ai sends tool calls to this endpoint
-app.post("/messages", express.json(), async (req, res) => {
-  const transport = transports[req.query.sessionId];
-  if (!transport) {
-    return res.status(404).json({ error: "Session not found" });
-  }
-  await transport.handlePostMessage(req, res);
-});
+app.get("/mcp", (_, res) =>
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed" },
+    id: null,
+  })
+);
+
+app.delete("/mcp", (_, res) =>
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed" },
+    id: null,
+  })
+);
 
 app.listen(PORT, () => {
   console.log(`\nGarmin MCP server running`);
   console.log(`  Local:  http://localhost:${PORT}`);
   console.log(`  Health: http://localhost:${PORT}/health`);
-  console.log(`  SSE:    http://localhost:${PORT}/sse`);
+  console.log(`  MCP:    http://localhost:${PORT}/mcp`);
   console.log(`\nConnect ngrok: ngrok http ${PORT}`);
-  console.log(`Then paste the https URL into Claude.ai settings → Integrations\n`);
+  console.log(`Then use the public HTTPS URL ending in /mcp\n`);
 });

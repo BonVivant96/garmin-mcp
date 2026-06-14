@@ -157,7 +157,7 @@ function createMcpServer() {
   );
 
   server.tool("resend_garmin_mfa",
-    "Explicitly ask Garmin to send a fresh six-digit MFA code for the pending login challenge, normally by email. This does not require a Garmin Authentication App.",
+    "Ask Garmin to send a fresh six-digit MFA code, normally by email. If Garmin exposes no resend endpoint, this starts a new login challenge to trigger a new email. Observe Garmin's cooldown before retrying.",
     {},
     async () => {
       const result = await resendGarminMfa();

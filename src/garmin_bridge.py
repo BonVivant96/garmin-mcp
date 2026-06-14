@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from garminconnect import Garmin
@@ -9,6 +10,8 @@ from garminconnect import Garmin
 
 garmin = None
 mfa_pending = False
+mfa_last_requested_at = 0.0
+MFA_RESEND_COOLDOWN_SECONDS = 30
 token_dir = str(Path(os.getenv("GARMIN_TOKEN_DIR", ".garmin-tokens")).resolve())
 
 
@@ -24,6 +27,7 @@ def mfa_details():
         return match.group(1) if match else None
 
     title_match = re.search(r"<title>([^<]*)</title>", html, re.IGNORECASE)
+    page_title = title_match.group(1) if title_match else None
     destination = value("codeSentTo")
     raw_method = value("mfaMethod") or getattr(garmin.client, "_mfa_method", None)
     if destination and "@" in destination:
@@ -31,6 +35,12 @@ def mfa_details():
         guidance = (
             "Enter the six-digit code Garmin sent by email. This challenge does "
             "not require a Garmin Authentication App."
+        )
+    elif page_title and "authentication application" in page_title.lower():
+        delivery_method = "email"
+        guidance = (
+            "Enter the six-digit code Garmin sent by email. Garmin's confusing "
+            "Authentication Application page title is used for this email-code flow."
         )
     elif destination:
         delivery_method = "one-time code"
@@ -50,24 +60,15 @@ def mfa_details():
         "flow": getattr(garmin.client, "_mfa_flow", None),
         "deliveryMethod": delivery_method,
         "destination": destination,
-        "page": title_match.group(1) if title_match else None,
+        "page": page_title,
         "canResend": bool(value("customerGuid") and value("mfaMethod")),
         "guidance": guidance,
     }
 
 
-def resend_mfa():
+def explicit_resend_mfa():
+    global mfa_last_requested_at
     details = mfa_details()
-    if not details["pending"]:
-        raise RuntimeError(
-            "No Garmin MFA challenge is pending. Call any Garmin data tool first "
-            "to start login."
-        )
-    if details["flow"] != "widget":
-        raise RuntimeError(
-            f"Garmin MFA resend is unavailable for the {details['flow']} login flow"
-        )
-
     response = garmin.client._widget_last_resp
     html = response.text
 
@@ -95,26 +96,19 @@ def resend_mfa():
         )
     if not result.ok:
         raise RuntimeError(f"Garmin MFA resend failed with HTTP {result.status_code}")
-    return {**details, "resent": True}
+    mfa_last_requested_at = time.monotonic()
+    return {**details, "requested": True, "requestMechanism": "explicit resend"}
 
 
-def ensure_login():
-    global garmin, mfa_pending
-    if garmin is not None and not mfa_pending:
-        return
-    if mfa_pending:
-        raise RuntimeError(
-            "Garmin MFA code required. Check your email or phone, then call "
-            "complete_garmin_mfa with the code."
-        )
-
+def start_login():
+    global garmin, mfa_pending, mfa_last_requested_at
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
     if not email or not password:
         raise RuntimeError("GARMIN_EMAIL and GARMIN_PASSWORD must be set in .env")
 
     garmin = Garmin(email=email, password=password, return_on_mfa=True)
-    # Widget MFA exposes Garmin's explicit resend-code endpoint.
+    # Widget MFA exposes Garmin's explicit resend-code endpoint when available.
     garmin.client.skip_strategies = [
         "mobile+cffi",
         "mobile+requests",
@@ -122,24 +116,72 @@ def ensure_login():
         "portal+requests",
     ]
     status, _ = garmin.login(token_dir)
-    if status == "needs_mfa":
-        mfa_pending = True
-        details = mfa_details()
-        if details["canResend"]:
-            details = resend_mfa()
-            message = (
-                f"Fresh Garmin MFA code requested via {details['deliveryMethod']} to "
-                f"{details['destination']}."
-            )
-        else:
-            message = (
-                "Garmin MFA challenge is pending, but Garmin did not permit an "
-                "explicit resend. Use the most recent code Garmin already issued."
-            )
+    if status != "needs_mfa":
+        garmin.client.dump(token_dir)
+        mfa_pending = False
+        return {"authenticated": True}
+
+    mfa_pending = True
+    # Posting credentials creates the challenge and triggers Garmin's automatic
+    # email flow, including widget variants that expose no resend endpoint.
+    mfa_last_requested_at = time.monotonic()
+    details = mfa_details()
+    if details["canResend"]:
+        return explicit_resend_mfa()
+    return {**details, "requested": True, "requestMechanism": "new login challenge"}
+
+
+def resend_mfa():
+    global garmin, mfa_pending
+    details = mfa_details()
+    if not details["pending"]:
+        return start_login()
+
+    elapsed = time.monotonic() - mfa_last_requested_at
+    if elapsed < MFA_RESEND_COOLDOWN_SECONDS:
+        wait_seconds = max(1, int(MFA_RESEND_COOLDOWN_SECONDS - elapsed))
         raise RuntimeError(
-            f"{message} Call complete_garmin_mfa with the code."
+            f"Garmin MFA resend cooldown active. Retry in about {wait_seconds} seconds."
         )
-    garmin.client.dump(token_dir)
+
+    if details["flow"] == "widget" and details["canResend"]:
+        return explicit_resend_mfa()
+
+    # Some Garmin email-MFA pages expose no resend endpoint. Starting a fresh
+    # widget login is the only way to ask Garmin to send another code.
+    garmin = None
+    mfa_pending = False
+    return start_login()
+
+
+def mfa_request_message(details):
+    destination = f" to {details['destination']}" if details.get("destination") else ""
+    return (
+        f"Fresh Garmin MFA code requested via {details.get('deliveryMethod', 'email')}"
+        f"{destination} using {details.get('requestMechanism', 'Garmin login')}. "
+        "Call complete_garmin_mfa with the latest six-digit email code."
+    )
+
+
+def ensure_login():
+    if garmin is not None and not mfa_pending:
+        return None
+    if mfa_pending:
+        elapsed = time.monotonic() - mfa_last_requested_at
+        if elapsed < MFA_RESEND_COOLDOWN_SECONDS:
+            wait_seconds = max(1, int(MFA_RESEND_COOLDOWN_SECONDS - elapsed))
+            return {
+                **mfa_details(),
+                "requested": False,
+                "retryAfterSeconds": wait_seconds,
+            }
+        details = resend_mfa()
+        return details
+
+    details = start_login()
+    if details.get("pending"):
+        return details
+    return None
 
 
 def complete_mfa(code):
@@ -162,7 +204,18 @@ def dispatch(method, args):
         return mfa_details()
     if method == "resend_mfa":
         return resend_mfa()
-    ensure_login()
+    mfa = ensure_login()
+    if mfa:
+        return {
+            "mfaRequired": True,
+            **mfa,
+            "message": (
+                mfa_request_message(mfa)
+                if mfa.get("requested")
+                else "Garmin MFA is pending. Call complete_garmin_mfa with the "
+                "latest six-digit email code."
+            ),
+        }
     return getattr(garmin, method)(*args)
 
 
@@ -173,4 +226,5 @@ for line in sys.stdin:
         response["result"] = dispatch(request["method"], request.get("args", []))
     except Exception as error:
         response["error"] = str(error)
+        print(f"Garmin bridge {request['method']} error: {error}", file=sys.stderr, flush=True)
     print(json.dumps(response, default=str), flush=True)

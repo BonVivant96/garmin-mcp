@@ -5,6 +5,8 @@ import readline from "node:readline";
 let bridge = null;
 let nextRequestId = 1;
 const pending = new Map();
+let nextResendAt = 0;
+let resendBlockReason = "";
 
 function startBridge() {
   const python = process.env.GARMIN_PYTHON || (process.platform === "win32" ? "py" : "python3");
@@ -51,6 +53,14 @@ function callBridge(method, args = []) {
   });
 }
 
+async function restartBridge() {
+  if (!bridge) return;
+  const currentBridge = bridge;
+  const exited = new Promise((resolve) => currentBridge.once("exit", resolve));
+  await callBridge("shutdown");
+  await exited;
+}
+
 const garminClient = {
   getActivities: (start, limit) => callBridge("get_activities", [start, limit]),
   getActivity: ({ activityId }) => callBridge("get_activity", [String(activityId)]),
@@ -75,5 +85,28 @@ export async function getGarminMfaStatus() {
 }
 
 export async function resendGarminMfa() {
-  return callBridge("resend_mfa");
+  const now = Date.now();
+  if (now < nextResendAt) {
+    const seconds = Math.ceil((nextResendAt - now) / 1000);
+    throw new Error(`${resendBlockReason} Retry in about ${seconds} seconds.`);
+  }
+
+  // A fresh process avoids stale challenge state. Never loop here: Garmin
+  // aggressively rate-limits repeated login and resend attempts.
+  await restartBridge();
+  try {
+    const result = await callBridge("resend_mfa");
+    const confirmed = result?.requested === true;
+    nextResendAt = now + (confirmed ? 300_000 : 30_000);
+    resendBlockReason = confirmed
+      ? "Garmin confirmed an MFA email request."
+      : "Garmin did not confirm an MFA email request.";
+    return result;
+  } catch (error) {
+    if (/429|rate limit/i.test(error.message)) {
+      nextResendAt = now + 900_000;
+      resendBlockReason = "Garmin rate-limited login; no MFA email was sent.";
+    }
+    throw error;
+  }
 }

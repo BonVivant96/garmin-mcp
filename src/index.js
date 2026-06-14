@@ -157,7 +157,7 @@ function createMcpServer() {
   );
 
   server.tool("resend_garmin_mfa",
-    "Ask Garmin to send one fresh six-digit MFA email. Call only when no email arrived, and wait at least five minutes between attempts because repeated requests prevent Garmin delivery.",
+    "Ask Garmin to send one fresh six-digit MFA email. Never call repeatedly: unconfirmed attempts wait 30 seconds, confirmed sends wait five minutes, and Garmin rate limits wait 15 minutes.",
     {},
     async () => {
       const result = await resendGarminMfa();

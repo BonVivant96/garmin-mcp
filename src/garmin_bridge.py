@@ -12,8 +12,10 @@ from garminconnect import Garmin
 garmin = None
 mfa_pending = False
 mfa_last_requested_at = 0.0
+mfa_last_attempt_at = 0.0
 failed_mfa_code_hashes = set()
 MFA_RESEND_COOLDOWN_SECONDS = 300
+MFA_ATTEMPT_COOLDOWN_SECONDS = 30
 token_dir = str(Path(os.getenv("GARMIN_TOKEN_DIR", ".garmin-tokens")).resolve())
 
 
@@ -25,8 +27,12 @@ def mfa_details():
     html = getattr(response, "text", "") or ""
 
     def value(name):
-        match = re.search(rf'var {name} = "([^"]*)"', html)
-        return match.group(1) if match else None
+        match = re.search(
+            rf"\bvar\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*;",
+            html,
+            re.DOTALL,
+        )
+        return match.group(2) if match else None
 
     title_match = re.search(r"<title>([^<]*)</title>", html, re.IGNORECASE)
     page_title = title_match.group(1) if title_match else None
@@ -75,10 +81,14 @@ def explicit_resend_mfa():
     html = response.text
 
     def required(name):
-        match = re.search(rf'var {name} = "([^"]*)"', html)
+        match = re.search(
+            rf"\bvar\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*;",
+            html,
+            re.DOTALL,
+        )
         if not match:
             raise RuntimeError(f"Garmin MFA page did not contain {name}")
-        return match.group(1)
+        return match.group(2)
 
     payload = {
         "customerGuid": required("customerGuid"),
@@ -103,15 +113,16 @@ def explicit_resend_mfa():
 
 
 def start_login():
-    global garmin, mfa_pending, mfa_last_requested_at, failed_mfa_code_hashes
+    global garmin, mfa_pending, mfa_last_attempt_at, failed_mfa_code_hashes
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
     if not email or not password:
         raise RuntimeError("GARMIN_EMAIL and GARMIN_PASSWORD must be set in .env")
 
-    garmin = Garmin(email=email, password=password, return_on_mfa=True)
     failed_mfa_code_hashes = set()
-    # Widget MFA can expose Garmin's explicit resend-code endpoint.
+    garmin = Garmin(email=email, password=password, return_on_mfa=True)
+    # Mobile/portal login is aggressively rate-limited and can poison the
+    # following widget session. Widget-only reliably exposes email resend.
     garmin.client.skip_strategies = [
         "mobile+cffi",
         "mobile+requests",
@@ -125,7 +136,7 @@ def start_login():
         return {"authenticated": True}
 
     mfa_pending = True
-    mfa_last_requested_at = time.monotonic()
+    mfa_last_attempt_at = time.monotonic()
     details = mfa_details()
     if details["canResend"]:
         return explicit_resend_mfa()
@@ -149,7 +160,10 @@ def resend_mfa():
     if not details["pending"]:
         return start_login()
 
-    elapsed = time.monotonic() - mfa_last_requested_at
+    if mfa_last_requested_at:
+        elapsed = time.monotonic() - mfa_last_requested_at
+    else:
+        elapsed = MFA_RESEND_COOLDOWN_SECONDS
     if elapsed < MFA_RESEND_COOLDOWN_SECONDS:
         wait_seconds = max(1, int(MFA_RESEND_COOLDOWN_SECONDS - elapsed))
         raise RuntimeError(
@@ -159,6 +173,14 @@ def resend_mfa():
 
     if details["flow"] == "widget" and details["canResend"]:
         return explicit_resend_mfa()
+
+    attempt_elapsed = time.monotonic() - mfa_last_attempt_at
+    if attempt_elapsed < MFA_ATTEMPT_COOLDOWN_SECONDS:
+        wait_seconds = max(1, int(MFA_ATTEMPT_COOLDOWN_SECONDS - attempt_elapsed))
+        raise RuntimeError(
+            "No Garmin MFA email send was confirmed. Retry the resend tool in about "
+            f"{wait_seconds} seconds."
+        )
 
     # Some Garmin email-MFA pages expose no resend endpoint. Start one fresh
     # widget challenge after cooldown; do not loop against Garmin.
@@ -247,8 +269,13 @@ for line in sys.stdin:
     request = json.loads(line)
     response = {"id": request["id"]}
     try:
-        response["result"] = dispatch(request["method"], request.get("args", []))
+        if request["method"] == "shutdown":
+            response["result"] = {"stopped": True}
+        else:
+            response["result"] = dispatch(request["method"], request.get("args", []))
     except Exception as error:
         response["error"] = str(error)
         print(f"Garmin bridge {request['method']} error: {error}", file=sys.stderr, flush=True)
     print(json.dumps(response, default=str), flush=True)
+    if request["method"] == "shutdown":
+        break

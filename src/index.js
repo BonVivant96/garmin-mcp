@@ -7,13 +7,11 @@ import express from "express";
 import { z } from "zod";
 import dotenv from "dotenv";
 import crypto from "node:crypto";
-import { getGarminClient } from "./garmin.js";
+import { completeGarminMfa, getGarminClient } from "./garmin.js";
 
 dotenv.config();
 
 const PORT = process.env.PORT || 3000;
-const GARMIN_API = "https://connectapi.garmin.com";
-
 // PUBLIC_URL must be your ngrok URL — set this in .env before connecting Claude.ai
 // e.g. PUBLIC_URL=https://xxxx.ngrok-free.app
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
@@ -133,6 +131,17 @@ const TARGET_TYPE = {
 function createMcpServer() {
   const server = new McpServer({ name: "garmin-mcp", version: "1.0.0" });
 
+  server.tool("complete_garmin_mfa",
+    "Complete a pending Garmin Connect login using the one-time MFA code sent by Garmin. Call another Garmin tool first to start login and request the code.",
+    {
+      code: z.string().regex(/^\d{6}$/, "Must be a 6-digit Garmin MFA code"),
+    },
+    async ({ code }) => {
+      const result = await completeGarminMfa(code);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
   server.tool("list_activities",
     "List recent Garmin activities. Returns summaries including sport type, start time, duration, distance, and average heart rate.",
     {
@@ -249,9 +258,7 @@ Example steps:
     },
     async ({ year, month }) => {
       const g = await getGarminClient();
-      const calendar = await g.get(
-        `${GARMIN_API}/calendar-service/year/${year}/month/${month - 1}`
-      );
+      const calendar = await g.getScheduledWorkouts(year, month);
       return { content: [{ type: "text", text: JSON.stringify(calendar, null, 2) }] };
     }
   );
@@ -264,10 +271,7 @@ Example steps:
     },
     async ({ workout_id, date }) => {
       const g = await getGarminClient();
-      const result = await g.post(
-        `${GARMIN_API}/workout-service/schedule/${workout_id}`,
-        { date }
-      );
+      const result = await g.scheduleWorkout(workout_id, date);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -310,7 +314,7 @@ app.get("/", (_, res) =>
 );
 
 app.get("/health", (_, res) =>
-  res.json({ status: "ok", server: "garmin-mcp", tools: 8 })
+  res.json({ status: "ok", server: "garmin-mcp", tools: 9 })
 );
 
 // MCP endpoint — requires valid bearer token issued by the OAuth flow above

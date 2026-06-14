@@ -5,13 +5,13 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "setup": "py -3.13 -m pip install -r requirements.txt"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "garmin-connect": "^1.6.2",
     "zod": "^4.4.3"
   }
 }

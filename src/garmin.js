@@ -1,45 +1,71 @@
-import garminConnect from "garmin-connect";
+import { spawn } from "node:child_process";
 import path from "node:path";
+import readline from "node:readline";
 
-const { GarminConnect } = garminConnect;
+let bridge = null;
+let nextRequestId = 1;
+const pending = new Map();
 
-let client = null;
-const DEFAULT_TOKEN_DIR = ".garmin-tokens";
+function startBridge() {
+  const python = process.env.GARMIN_PYTHON || (process.platform === "win32" ? "py" : "python3");
+  const args = process.platform === "win32" && !process.env.GARMIN_PYTHON
+    ? ["-3.13", path.resolve("src/garmin_bridge.py")]
+    : [path.resolve("src/garmin_bridge.py")];
 
-/**
- * Returns a logged-in GarminConnect client, creating and caching one on first call.
- * Throws a clear error if credentials are missing or login fails.
- */
-export async function getGarminClient() {
-  if (client) return client;
+  bridge = spawn(python, args, {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ["pipe", "pipe", "inherit"],
+    windowsHide: true,
+  });
 
-  const { GARMIN_EMAIL, GARMIN_PASSWORD } = process.env;
-  if (!GARMIN_EMAIL || !GARMIN_PASSWORD) {
-    throw new Error(
-      "GARMIN_EMAIL and GARMIN_PASSWORD must be set in your .env file"
-    );
-  }
-
-  client = new GarminConnect({ username: GARMIN_EMAIL, password: GARMIN_PASSWORD });
-  const tokenDir = path.resolve(process.env.GARMIN_TOKEN_DIR || DEFAULT_TOKEN_DIR);
-
-  try {
+  readline.createInterface({ input: bridge.stdout }).on("line", (line) => {
+    let message;
     try {
-      client.loadTokenByFile(tokenDir);
-      await client.getUserProfile();
-      console.log("✓ Restored Garmin Connect session");
+      message = JSON.parse(line);
     } catch {
-      await client.login(GARMIN_EMAIL, GARMIN_PASSWORD);
-      client.exportTokenToFile(tokenDir);
-      console.log("✓ Authenticated with Garmin Connect");
+      return;
     }
-  } catch (err) {
-    client = null; // allow retry on next call
-    throw new Error(
-      `Garmin login failed: ${err.message}. ` +
-      "The garmin-connect package does not support MFA; verify credentials or temporarily disable MFA for one login so reusable tokens can be saved."
-    );
-  }
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    if (message.error) request.reject(new Error(message.error));
+    else request.resolve(message.result);
+  });
 
-  return client;
+  bridge.on("exit", (code) => {
+    bridge = null;
+    for (const request of pending.values()) {
+      request.reject(new Error(`Garmin bridge exited with code ${code}`));
+    }
+    pending.clear();
+  });
+}
+
+function callBridge(method, args = []) {
+  if (!bridge) startBridge();
+  const id = nextRequestId++;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    bridge.stdin.write(`${JSON.stringify({ id, method, args })}\n`);
+  });
+}
+
+const garminClient = {
+  getActivities: (start, limit) => callBridge("get_activities", [start, limit]),
+  getActivity: ({ activityId }) => callBridge("get_activity", [String(activityId)]),
+  getWorkouts: (start, limit) => callBridge("get_workouts", [start, limit]),
+  getWorkoutDetail: ({ workoutId }) => callBridge("get_workout_by_id", [workoutId]),
+  addWorkout: (workout) => callBridge("upload_workout", [workout]),
+  deleteWorkout: ({ workoutId }) => callBridge("delete_workout", [workoutId]),
+  getScheduledWorkouts: (year, month) => callBridge("get_scheduled_workouts", [year, month]),
+  scheduleWorkout: (workoutId, date) => callBridge("schedule_workout", [workoutId, date]),
+};
+
+export async function getGarminClient() {
+  return garminClient;
+}
+
+export async function completeGarminMfa(code) {
+  return callBridge("complete_mfa", [code]);
 }

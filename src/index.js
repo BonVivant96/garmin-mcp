@@ -281,7 +281,7 @@ app.get("/health", (_, res) =>
   res.json({ status: "ok", server: "garmin-mcp", tools: 8 })
 );
 
-app.post("/mcp", async (req, res) => {
+async function handleMcpPost(req, res) {
   const server = createServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -305,7 +305,11 @@ app.post("/mcp", async (req, res) => {
     await transport.close();
     await server.close();
   });
-});
+}
+
+// Support clients configured with either the recommended /mcp URL or tunnel root.
+app.post("/mcp", handleMcpPost);
+app.post("/", handleMcpPost);
 
 app.get("/mcp", (_, res) =>
   res.status(405).json({

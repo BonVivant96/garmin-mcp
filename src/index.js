@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import express from "express";
 import { z } from "zod";
 import dotenv from "dotenv";
@@ -11,16 +12,17 @@ import { getGarminClient } from "./garmin.js";
 dotenv.config();
 
 const PORT = process.env.PORT || 3000;
+const GARMIN_API = "https://connectapi.garmin.com";
 
 // PUBLIC_URL must be your ngrok URL — set this in .env before connecting Claude.ai
 // e.g. PUBLIC_URL=https://xxxx.ngrok-free.app
-const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 
 // ─── In-memory OAuth provider (personal server — auto-approves everything) ────
 
 const clients = new Map();  // clientId → client record
 const codes   = new Map();  // authCode → { clientId, redirectUri, codeChallenge }
-const tokens  = new Map();  // accessToken → { clientId }
+const tokens  = new Map();  // accessToken → { clientId, expiresAt }
 
 const oauthProvider = {
   clientsStore: {
@@ -31,9 +33,11 @@ const oauthProvider = {
       const registered = {
         ...client,
         client_id: client.client_id || crypto.randomUUID(),
-        client_secret: crypto.randomBytes(32).toString("hex"),
-        client_id_issued_at: Math.floor(Date.now() / 1000),
+        client_id_issued_at: client.client_id_issued_at || Math.floor(Date.now() / 1000),
       };
+      if (registered.token_endpoint_auth_method !== "none" && !registered.client_secret) {
+        registered.client_secret = crypto.randomBytes(32).toString("hex");
+      }
       clients.set(registered.client_id, registered);
       console.log(`✓ OAuth client registered: ${registered.client_id}`);
       return registered;
@@ -55,30 +59,46 @@ const oauthProvider = {
     res.redirect(url.toString());
   },
 
-  async exchangeAuthorizationCode(client, code, _codeVerifier, _redirectUri) {
+  async challengeForAuthorizationCode(client, code) {
     const stored = codes.get(code);
     if (!stored || stored.clientId !== client.client_id) {
       throw new Error("Invalid authorization code");
     }
+    return stored.codeChallenge;
+  },
+
+  async exchangeAuthorizationCode(client, code, _codeVerifier, redirectUri) {
+    const stored = codes.get(code);
+    if (
+      !stored ||
+      stored.clientId !== client.client_id ||
+      stored.redirectUri !== redirectUri
+    ) {
+      throw new Error("Invalid authorization code");
+    }
     codes.delete(code);
     const accessToken = crypto.randomBytes(32).toString("hex");
-    tokens.set(accessToken, { clientId: client.client_id });
+    const expiresIn = 86400 * 30;
+    tokens.set(accessToken, {
+      clientId: client.client_id,
+      expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
+    });
     console.log(`✓ Token issued for: ${client.client_id}`);
     return {
       access_token: accessToken,
       token_type: "bearer",
-      expires_in: 86400 * 30, // 30 days
+      expires_in: expiresIn,
     };
   },
 
   async verifyAccessToken(token) {
     const info = tokens.get(token);
-    if (!info) throw new Error("Invalid or expired token");
-    return { token, clientId: info.clientId, scopes: [] };
+    if (!info) throw new InvalidTokenError("Invalid or expired token");
+    return { token, clientId: info.clientId, scopes: [], expiresAt: info.expiresAt };
   },
 
-  async revokeToken({ token }) {
-    tokens.delete(token);
+  async revokeToken(_client, request) {
+    tokens.delete(request.token);
   },
 };
 
@@ -154,7 +174,7 @@ function createMcpServer() {
     { workout_id: z.number().int().describe("Garmin workout ID") },
     async ({ workout_id }) => {
       const g = await getGarminClient();
-      const workout = await g.getWorkout({ workoutId: workout_id });
+      const workout = await g.getWorkoutDetail({ workoutId: workout_id });
       return { content: [{ type: "text", text: JSON.stringify(workout, null, 2) }] };
     }
   );
@@ -229,7 +249,9 @@ Example steps:
     },
     async ({ year, month }) => {
       const g = await getGarminClient();
-      const calendar = await g.getCalendar(year, month - 1); // garmin-connect is 0-indexed
+      const calendar = await g.get(
+        `${GARMIN_API}/calendar-service/year/${year}/month/${month - 1}`
+      );
       return { content: [{ type: "text", text: JSON.stringify(calendar, null, 2) }] };
     }
   );
@@ -242,7 +264,10 @@ Example steps:
     },
     async ({ workout_id, date }) => {
       const g = await getGarminClient();
-      const result = await g.scheduleWorkout({ workoutId: workout_id }, date);
+      const result = await g.post(
+        `${GARMIN_API}/workout-service/schedule/${workout_id}`,
+        { date }
+      );
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -304,10 +329,15 @@ async function handleMcpPost(req, res) {
   res.on("close", async () => { await transport.close(); await server.close(); });
 }
 
-app.post("/mcp",
-  requireBearerAuth({ provider: oauthProvider, requiredScopes: [] }),
-  handleMcpPost
-);
+const requireMcpAuth = requireBearerAuth({
+  verifier: oauthProvider,
+  requiredScopes: [],
+  resourceMetadataUrl: `${PUBLIC_URL}/.well-known/oauth-protected-resource`,
+});
+
+// Support clients configured with either the recommended /mcp URL or tunnel root.
+app.post("/mcp", requireMcpAuth, handleMcpPost);
+app.post("/", requireMcpAuth, handleMcpPost);
 
 app.get("/mcp",    (_, res) => res.status(405).end());
 app.delete("/mcp", (_, res) => res.status(405).end());

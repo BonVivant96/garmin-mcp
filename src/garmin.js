@@ -1,8 +1,10 @@
 import garminConnect from "garmin-connect";
+import path from "node:path";
 
 const { GarminConnect } = garminConnect;
 
 let client = null;
+const DEFAULT_TOKEN_DIR = ".garmin-tokens";
 
 /**
  * Returns a logged-in GarminConnect client, creating and caching one on first call.
@@ -19,13 +21,24 @@ export async function getGarminClient() {
   }
 
   client = new GarminConnect({ username: GARMIN_EMAIL, password: GARMIN_PASSWORD });
+  const tokenDir = path.resolve(process.env.GARMIN_TOKEN_DIR || DEFAULT_TOKEN_DIR);
 
   try {
-    await client.login(GARMIN_EMAIL, GARMIN_PASSWORD);
-    console.log("✓ Authenticated with Garmin Connect");
+    try {
+      client.loadTokenByFile(tokenDir);
+      await client.getUserProfile();
+      console.log("✓ Restored Garmin Connect session");
+    } catch {
+      await client.login(GARMIN_EMAIL, GARMIN_PASSWORD);
+      client.exportTokenToFile(tokenDir);
+      console.log("✓ Authenticated with Garmin Connect");
+    }
   } catch (err) {
     client = null; // allow retry on next call
-    throw new Error(`Garmin login failed: ${err.message}`);
+    throw new Error(
+      `Garmin login failed: ${err.message}. ` +
+      "The garmin-connect package does not support MFA; verify credentials or temporarily disable MFA for one login so reusable tokens can be saved."
+    );
   }
 
   return client;

@@ -69,3 +69,11 @@ export async function getGarminClient() {
 export async function completeGarminMfa(code) {
   return callBridge("complete_mfa", [code]);
 }
+
+export async function getGarminMfaStatus() {
+  return callBridge("get_mfa_status");
+}
+
+export async function resendGarminMfa() {
+  return callBridge("resend_mfa");
+}

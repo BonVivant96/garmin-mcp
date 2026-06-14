@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -9,6 +10,70 @@ from garminconnect import Garmin
 garmin = None
 mfa_pending = False
 token_dir = str(Path(os.getenv("GARMIN_TOKEN_DIR", ".garmin-tokens")).resolve())
+
+
+def mfa_details():
+    if garmin is None or not mfa_pending:
+        return {"pending": False}
+
+    response = getattr(garmin.client, "_widget_last_resp", None)
+    html = getattr(response, "text", "") or ""
+
+    def value(name):
+        match = re.search(rf'var {name} = "([^"]*)"', html)
+        return match.group(1) if match else None
+
+    title_match = re.search(r"<title>([^<]*)</title>", html, re.IGNORECASE)
+    return {
+        "pending": True,
+        "flow": getattr(garmin.client, "_mfa_flow", None),
+        "method": value("mfaMethod") or getattr(garmin.client, "_mfa_method", None),
+        "destination": value("codeSentTo"),
+        "page": title_match.group(1) if title_match else None,
+        "canResend": bool(value("customerGuid") and value("mfaMethod")),
+    }
+
+
+def resend_mfa():
+    details = mfa_details()
+    if not details["pending"]:
+        raise RuntimeError(
+            "No Garmin MFA challenge is pending. Call any Garmin data tool first "
+            "to start login."
+        )
+    if details["flow"] != "widget":
+        raise RuntimeError(
+            f"Garmin MFA resend is unavailable for the {details['flow']} login flow"
+        )
+
+    response = garmin.client._widget_last_resp
+    html = response.text
+
+    def required(name):
+        match = re.search(rf'var {name} = "([^"]*)"', html)
+        if not match:
+            raise RuntimeError(f"Garmin MFA page did not contain {name}")
+        return match.group(1)
+
+    payload = {
+        "customerGuid": required("customerGuid"),
+        "mfaMethod": required("mfaMethod"),
+        "locale": required("locale"),
+    }
+    result = garmin.client._mfa_session.post(
+        "https://sso.garmin.com/sso/verifyMFA/mfaCode",
+        params={"clientId": required("clientId")},
+        json=payload,
+        timeout=30,
+    )
+    if result.status_code == 429:
+        raise RuntimeError(
+            "Garmin refused another MFA code because its resend limit was reached. "
+            "Wait before retrying."
+        )
+    if not result.ok:
+        raise RuntimeError(f"Garmin MFA resend failed with HTTP {result.status_code}")
+    return {**details, "resent": True}
 
 
 def ensure_login():
@@ -27,12 +92,30 @@ def ensure_login():
         raise RuntimeError("GARMIN_EMAIL and GARMIN_PASSWORD must be set in .env")
 
     garmin = Garmin(email=email, password=password, return_on_mfa=True)
+    # Widget MFA exposes Garmin's explicit resend-code endpoint.
+    garmin.client.skip_strategies = [
+        "mobile+cffi",
+        "mobile+requests",
+        "portal+cffi",
+        "portal+requests",
+    ]
     status, _ = garmin.login(token_dir)
     if status == "needs_mfa":
         mfa_pending = True
+        details = mfa_details()
+        if details["canResend"]:
+            details = resend_mfa()
+            message = (
+                f"Fresh Garmin MFA code requested via {details['method']} to "
+                f"{details['destination']}."
+            )
+        else:
+            message = (
+                "Garmin MFA challenge is pending, but Garmin did not permit an "
+                "explicit resend. Use the most recent code Garmin already issued."
+            )
         raise RuntimeError(
-            "Garmin MFA code required. Check your email or phone, then call "
-            "complete_garmin_mfa with the code."
+            f"{message} Call complete_garmin_mfa with the code."
         )
     garmin.client.dump(token_dir)
 
@@ -53,6 +136,10 @@ def complete_mfa(code):
 def dispatch(method, args):
     if method == "complete_mfa":
         return complete_mfa(*args)
+    if method == "get_mfa_status":
+        return mfa_details()
+    if method == "resend_mfa":
+        return resend_mfa()
     ensure_login()
     return getattr(garmin, method)(*args)
 

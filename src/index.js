@@ -7,7 +7,12 @@ import express from "express";
 import { z } from "zod";
 import dotenv from "dotenv";
 import crypto from "node:crypto";
-import { completeGarminMfa, getGarminClient } from "./garmin.js";
+import {
+  completeGarminMfa,
+  getGarminClient,
+  getGarminMfaStatus,
+  resendGarminMfa,
+} from "./garmin.js";
 
 dotenv.config();
 
@@ -138,6 +143,24 @@ function createMcpServer() {
     },
     async ({ code }) => {
       const result = await completeGarminMfa(code);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool("get_garmin_mfa_status",
+    "Check whether Garmin MFA is pending and show the masked destination and delivery method.",
+    {},
+    async () => {
+      const result = await getGarminMfaStatus();
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool("resend_garmin_mfa",
+    "Explicitly ask Garmin to send a fresh MFA code for the pending login challenge.",
+    {},
+    async () => {
+      const result = await resendGarminMfa();
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -314,7 +337,7 @@ app.get("/", (_, res) =>
 );
 
 app.get("/health", (_, res) =>
-  res.json({ status: "ok", server: "garmin-mcp", tools: 9 })
+  res.json({ status: "ok", server: "garmin-mcp", tools: 11 })
 );
 
 // MCP endpoint — requires valid bearer token issued by the OAuth flow above

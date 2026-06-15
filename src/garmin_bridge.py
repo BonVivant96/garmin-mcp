@@ -27,8 +27,17 @@ def mfa_details():
     html = getattr(response, "text", "") or ""
 
     def value(name):
+        # var/let/const declaration
         match = re.search(
-            rf"\bvar\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*;",
+            rf"\b(?:var|let|const)\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1",
+            html,
+            re.DOTALL,
+        )
+        if match:
+            return match.group(2)
+        # Object / JSON property:  "name": "value"  or  name: 'value'
+        match = re.search(
+            rf"""['\"]?{re.escape(name)}['\"]?\s*:\s*(['\"])(.*?)\1""",
             html,
             re.DOTALL,
         )
@@ -63,43 +72,108 @@ def mfa_details():
             "Garmin Authentication App is required from Garmin's internal method value."
         )
 
+    # canResend = True only when customerGuid is extractable — verifyMFA/mfaCode
+    # requires it and returns 401 without it. Portal/iOS flows that auto-send
+    # the email are handled in start_login() before reaching explicit_resend_mfa().
+    can_resend = bool(value("customerGuid") and (value("mfaMethod") or getattr(garmin.client, "_mfa_method", None)))
+    if not can_resend and html:
+        print(
+            f"[garmin-bridge] canResend=False. title={page_title!r} "
+            f"html_len={len(html)} snippet={html[:2000]!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # Debug: try to expose customerGuid location and cookies for investigation
+    cg_in_html = bool(re.search(r"customerGuid", html, re.IGNORECASE))
+    try:
+        cookie_keys = sorted(dict(getattr(getattr(garmin.client, "_mfa_session", None), "cookies", {})).keys())
+    except Exception:
+        cookie_keys = None
+
     return {
         "pending": True,
         "flow": getattr(garmin.client, "_mfa_flow", None),
         "deliveryMethod": delivery_method,
         "destination": destination,
         "page": page_title,
-        "canResend": bool(value("customerGuid") and value("mfaMethod")),
+        "canResend": can_resend,
         "guidance": guidance,
+        "_debug": {"customerGuidInHtml": cg_in_html, "cookieKeys": cookie_keys},
     }
 
 
 def explicit_resend_mfa():
     global mfa_last_requested_at
     details = mfa_details()
-    response = garmin.client._widget_last_resp
-    html = response.text
+    response = getattr(garmin.client, "_widget_last_resp", None)
+    html = getattr(response, "text", "") or ""
 
-    def required(name):
-        match = re.search(
-            rf"\bvar\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*;",
-            html,
-            re.DOTALL,
+    def optional(name):
+        # var/let/const declaration
+        m = re.search(
+            rf"\b(?:var|let|const)\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1",
+            html, re.DOTALL,
         )
-        if not match:
-            raise RuntimeError(f"Garmin MFA page did not contain {name}")
-        return match.group(2)
+        if m:
+            return m.group(2)
+        # object/JSON property
+        m = re.search(
+            rf"""['\"]?{re.escape(name)}['\"]?\s*:\s*(['\"])(.*?)\1""",
+            html, re.DOTALL,
+        )
+        if m:
+            return m.group(2)
+        # HTML hidden input:  <input ... name="customerGuid" ... value="xxx">
+        m = re.search(
+            rf"""<input[^>]+name=['\"]?{re.escape(name)}['\"]?[^>]+value=['\"]([^'\"]+)['\"]""",
+            html, re.DOTALL | re.IGNORECASE,
+        )
+        if m:
+            return m.group(1)
+        # Also try value before name:  <input ... value="xxx" ... name="customerGuid">
+        m = re.search(
+            rf"""<input[^>]+value=['\"]([^'\"]+)['\"][^>]+name=['\"]?{re.escape(name)}['\"]?""",
+            html, re.DOTALL | re.IGNORECASE,
+        )
+        return m.group(1) if m else None
 
-    payload = {
-        "customerGuid": required("customerGuid"),
-        "mfaMethod": required("mfaMethod"),
-        "locale": required("locale"),
-    }
+    mfa_method = optional("mfaMethod") or getattr(garmin.client, "_mfa_method", None) or "EMAIL"
+    locale = optional("locale") or "en-US"
+    client_id = optional("clientId") or "GarminConnect"
+    customer_guid = optional("customerGuid")  # None OK — session cookies identify user
+
+    payload = {"mfaMethod": mfa_method, "locale": locale}
+    if customer_guid:
+        payload["customerGuid"] = customer_guid
+
+    # Diagnostic: locate customerGuid in HTML and dump cookies
+    cg_match = re.search(r"customerGuid", html, re.IGNORECASE)
+    if cg_match:
+        s, e = max(0, cg_match.start() - 30), min(len(html), cg_match.end() + 150)
+        print(f"[garmin-bridge] customerGuid found at {cg_match.start()}: {html[s:e]!r}", file=sys.stderr, flush=True)
+    else:
+        print(f"[garmin-bridge] customerGuid NOT in HTML (len={len(html)})", file=sys.stderr, flush=True)
+    try:
+        cookie_keys = list(dict(garmin.client._mfa_session.cookies).keys())
+        print(f"[garmin-bridge] session cookie keys: {cookie_keys}", file=sys.stderr, flush=True)
+    except Exception as ce:
+        print(f"[garmin-bridge] can't read cookies: {ce}", file=sys.stderr, flush=True)
+    print(
+        f"[garmin-bridge] explicit_resend_mfa: method={mfa_method} "
+        f"guid={'present' if customer_guid else 'absent'} clientId={client_id}",
+        file=sys.stderr, flush=True,
+    )
     result = garmin.client._mfa_session.post(
         "https://sso.garmin.com/sso/verifyMFA/mfaCode",
-        params={"clientId": required("clientId")},
+        params={"clientId": client_id},
+        headers=getattr(garmin.client, "_mfa_post_headers", {}),
         json=payload,
         timeout=30,
+    )
+    print(
+        f"[garmin-bridge] verifyMFA/mfaCode response: {result.status_code}",
+        file=sys.stderr, flush=True,
     )
     if result.status_code == 429:
         raise RuntimeError(
@@ -121,14 +195,14 @@ def start_login():
 
     failed_mfa_code_hashes = set()
     garmin = Garmin(email=email, password=password, return_on_mfa=True)
-    # Mobile/portal login is aggressively rate-limited and can poison the
-    # following widget session. Widget-only reliably exposes email resend.
-    garmin.client.skip_strategies = [
-        "mobile+cffi",
+    # mobile+cffi (primary): Garmin auto-sends the email via the iOS API with
+    # no anti-WAF delay. Falls back to widget+cffi which can use
+    # explicit_resend_mfa() when customerGuid is in the page HTML.
+    garmin.client.skip_strategies = {
         "mobile+requests",
         "portal+cffi",
         "portal+requests",
-    ]
+    }
     status, _ = garmin.login(token_dir)
     if status != "needs_mfa":
         garmin.client.dump(token_dir)
@@ -138,25 +212,44 @@ def start_login():
     mfa_pending = True
     mfa_last_attempt_at = time.monotonic()
     details = mfa_details()
+
+    # Portal/iOS flow: Garmin auto-sent the email when credentials were posted.
+    mfa_flow = getattr(garmin.client, "_mfa_flow", None)
+    mfa_method = str(getattr(garmin.client, "_mfa_method", "") or "")
+    if mfa_flow in {"portal", "ios"} and mfa_method.lower() in {"email", "sms"}:
+        return {
+            **details,
+            "requested": True,
+            "requestMechanism": f"Garmin {mfa_flow} login",
+            "reason": None,
+        }
+
+    # Widget flow: try explicit POST to verifyMFA/mfaCode (requires customerGuid).
     if details["canResend"]:
         return explicit_resend_mfa()
 
-    # Garmin sent the code implicitly when credentials were submitted — this
-    # page variant ("Authentication Application") appears when an email challenge
-    # is already in flight, meaning the code is already on its way to the inbox.
-    # Return requested=True so Claude asks for the code rather than looping.
-    implicit_email = details.get("deliveryMethod") == "email"
+    # Widget email MFA (page title "Authentication Application") without customerGuid:
+    # Garmin sends the code server-side when the MFA session is created. The
+    # verifyMFA/mfaCode endpoint (resend) is inaccessible without customerGuid, but
+    # the initial code is already in transit. Returning requested=True stops Claude
+    # from looping on resends and tells the user to check their inbox.
+    if details.get("deliveryMethod") == "email":
+        return {
+            **details,
+            "requested": True,
+            "requestMechanism": "Garmin login",
+            "reason": (
+                "Garmin sent the code when credentials were submitted. "
+                "The explicit resend endpoint is inaccessible (customerGuid absent). "
+                "Check email and spam for the six-digit code."
+            ),
+        }
+
     return {
         **details,
-        "requested": implicit_email,
-        "requestMechanism": "Garmin login" if implicit_email else None,
-        "reason": (
-            None if implicit_email
-            else (
-                "Garmin did not expose its email resend endpoint. An existing email "
-                "challenge may still be active; wait before requesting another."
-            )
-        ),
+        "requested": False,
+        "requestMechanism": None,
+        "reason": "Garmin MFA triggered but email delivery method not confirmed.",
     }
 
 

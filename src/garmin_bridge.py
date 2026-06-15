@@ -141,15 +141,21 @@ def start_login():
     if details["canResend"]:
         return explicit_resend_mfa()
 
-    # Garmin serves this variant when an email challenge already exists. It has
-    # no resend control, so do not claim that opening it sent another email.
+    # Garmin sent the code implicitly when credentials were submitted — this
+    # page variant ("Authentication Application") appears when an email challenge
+    # is already in flight, meaning the code is already on its way to the inbox.
+    # Return requested=True so Claude asks for the code rather than looping.
+    implicit_email = details.get("deliveryMethod") == "email"
     return {
         **details,
-        "requested": False,
-        "requestMechanism": None,
+        "requested": implicit_email,
+        "requestMechanism": "Garmin login" if implicit_email else None,
         "reason": (
-            "Garmin did not expose its email resend endpoint. An existing email "
-            "challenge may still be active; wait before requesting another."
+            None if implicit_email
+            else (
+                "Garmin did not expose its email resend endpoint. An existing email "
+                "challenge may still be active; wait before requesting another."
+            )
         ),
     }
 
